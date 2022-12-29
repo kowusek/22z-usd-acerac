@@ -4,10 +4,12 @@ from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 import gym
 import numpy as np
 import torch as th
+from torch import nn
 from torch.nn import functional as F
 
 from copy import deepcopy
-from algos.pi_buffer import PiReplayBuffer
+from algos.pi_buffer import PiReplayBuffer, PiTrajectoryReplayBuffer
+from algos.policy import ACERPolicy, Actor
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.noise import ActionNoise, VectorizedActionNoise
@@ -81,25 +83,32 @@ class ACER(OffPolicyAlgorithm):
     """
 
     policy_aliases: Dict[str, Type[BasePolicy]] = {
-        "MlpPolicy": ActorCriticPolicy,
+        "MlpPolicy": ACERPolicy,
     }
 
-    policy: ActorCriticPolicy
-    replay_buffer: PiReplayBuffer
+    policy: ACERPolicy
+    actor: Actor
+    critic: nn.Module
+    replay_buffer: PiTrajectoryReplayBuffer
 
     def __init__(
         self,
-        policy: Union[str, Type[ActorCriticPolicy]],
+        policy: Union[str, Type[ACERPolicy]],
         env: Union[GymEnv, str],
-        learning_rate: Union[float, Schedule] = 2e-5,
-        buffer_size: int = 1_000_000,  # 1e6
-        learning_starts: int = 5000,
+        learning_rate: Union[float, Schedule] = 1e-4,
+        buffer_num_trajectories: int = 1000,
+        buffer_trajectory_size: int = 1000,  # epizode len
+        learning_starts: int = 10000,
         batch_size: int = 32,
-        tau: float = 0.05,  # min{policy_frac, b}; b = tau
+        buffer_sample_trajectory_size: int = 16,
+        alpha: float = 0.9,  # SUM component
+        tau: float = 2.00,  # min{policy_frac, b}; b = tau
         gamma: float = 0.99,
         train_freq: Union[int, Tuple[int, str]] = 4,
         gradient_steps: int = 1,
-        replay_buffer_class: Optional[Type[PiReplayBuffer]] = PiReplayBuffer,
+        replay_buffer_class: Optional[
+            Type[PiTrajectoryReplayBuffer]
+        ] = PiTrajectoryReplayBuffer,
         replay_buffer_kwargs: Optional[Dict[str, Any]] = None,
         optimize_memory_usage: bool = False,
         exploration_fraction: float = 0.1,
@@ -119,7 +128,7 @@ class ACER(OffPolicyAlgorithm):
             policy,
             env,
             learning_rate,
-            buffer_size,
+            1,
             learning_starts,
             batch_size,
             tau,
@@ -127,7 +136,7 @@ class ACER(OffPolicyAlgorithm):
             train_freq,
             gradient_steps,
             action_noise=None,  # No action noise
-            replay_buffer_class=replay_buffer_class,
+            replay_buffer_class=None,
             replay_buffer_kwargs=replay_buffer_kwargs,
             policy_kwargs=policy_kwargs,
             tensorboard_log=tensorboard_log,
@@ -141,6 +150,18 @@ class ACER(OffPolicyAlgorithm):
             support_multi_env=True,
         )
 
+        self.replay_buffer = replay_buffer_class(
+            buffer_num_trajectories=buffer_num_trajectories,
+            trajectory_size=buffer_trajectory_size,
+            observation_space=self.observation_space,
+            action_space=self.action_space,
+            device=self.device,
+            n_envs=self.n_envs,
+            optimize_memory_usage=False,
+        )
+        self.buffer_sample_trajectory_size = buffer_sample_trajectory_size
+
+        self.alpha = alpha
         self.exploration_initial_eps = exploration_initial_eps
         self.exploration_final_eps = exploration_final_eps
         self.exploration_fraction = exploration_fraction
@@ -165,89 +186,106 @@ class ACER(OffPolicyAlgorithm):
         )
 
     def _create_aliases(self) -> None:
-        pass
-        # self.actor = self.policy.actor
-        # self.critic = self.policy.critic
+        # pass
+        self.actor = self.policy.actor
+        self.critic = self.policy.critic
 
     def train(self, gradient_steps: int, batch_size: int = 100) -> None:
 
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
         # Update learning rate according to schedule
-        self._update_learning_rate(self.policy.optimizer)
+        self._update_learning_rate([self.actor.optimizer, self.critic.optimizer])
 
         losses = []
-        v_losses = []
-        p_losses = []
+        actor_losses, critic_losses = [], []
+        sums = []
         for _ in range(gradient_steps):
             # Sample replay buffer
             replay_data = self.replay_buffer.sample(
-                batch_size, env=self._vec_normalize_env
+                batch_size,
+                self.buffer_sample_trajectory_size,
+                env=self._vec_normalize_env,
             )
 
-            current_distributions = self.policy.get_distribution(
-                replay_data.observations
+            # We need to sample because `log_std` may have changed between two gradient steps
+            if self.use_sde:
+                self.actor.reset_noise()
+
+            rolling_pi_coef = th.full(
+                (self.batch_size, 1), 1.0, dtype=th.float32, device=self.device
             )
-            current_action_log_probs = current_distributions.log_prob(
-                replay_data.actions
+            SUM = th.full(
+                (self.batch_size, 1), 0.0, dtype=th.float32, device=self.device
             )
 
-            # Get current state value (critic) estimates
-            current_values = self.policy.predict_values(replay_data.observations)
+            # The second dimension of the replay data tensors is the in-trajectory index.
+            for k in range(replay_data.actions.shape[1]):
+                actions = replay_data.actions[:, k]
+                log_probs = replay_data.log_probs[:, k].unsqueeze(-1)
+                observations = replay_data.observations[:, k]
+                next_observations = replay_data.next_observations[:, k]
+                dones = replay_data.dones[:, k]
+                rewards = replay_data.rewards[:, k]
 
-            with th.no_grad():
-                next_values = self.policy.predict_values(replay_data.next_observations)
-                # Avoid potential broadcast issue
-                next_values = next_values.reshape(-1, 1)
+                # Log probabilities of the sampled actions according to the current policy
+                current_action_log_probs = self.actor.log_prob_of_actions(
+                    observations, actions
+                ).unsqueeze(-1)
+                current_values = self.policy.predict_values(observations)
+                if k == 0:
+                    k0_current_action_log_probs = current_action_log_probs
+                    k0_current_values = current_values
 
-                target_values = (
-                    replay_data.rewards
-                    + (1 - replay_data.dones) * self.gamma * next_values
-                )
-                advantage = target_values - current_values
+                with th.no_grad():
+                    rolling_pi_coef *= th.exp(current_action_log_probs - log_probs)
+                    clamped_pi_coef = th.minimum(
+                        rolling_pi_coef,
+                        th.full(
+                            size=rolling_pi_coef.shape,
+                            fill_value=self.tau,
+                            device=self.device,
+                        ),
+                    )
 
-                policy_proximity_coeff: th.Tensor = th.minimum(
-                    th.exp(
-                        current_action_log_probs - replay_data.log_probs
-                    ),  # ? detach replay_data.log_probs?
-                    th.full(
-                        size=current_action_log_probs.shape,
-                        fill_value=self.tau,
-                        device=self.device,
-                    ),
-                ).detach()
+                    next_values = self.policy.predict_values(next_observations)
+                    # Avoid potential broadcast issue
+                    next_values = next_values.reshape(-1, 1)
 
-            policy_loss = (
-                advantage.detach()  # ? detach() needed?
-                * current_action_log_probs  # requires_grad=True
-                * policy_proximity_coeff  # detached scalar
-            ).mean()
+                    target_values = rewards + (1 - dones) * self.gamma * next_values
+                    advantage = target_values - current_values
 
-            v_loss = (
-                advantage.detach()  # ? detach() needed?; detached scalar
-                * current_values  # requires_grad=True
-                * policy_proximity_coeff  # detached scalar
-            ).mean()
+                    SUM += (self.alpha**k) * advantage * clamped_pi_coef
 
-            loss = policy_loss + v_loss
-            losses.append(loss.item())
-            v_losses.append(v_loss.item())
-            p_losses.append(policy_loss.item())
+            actor_loss = k0_current_action_log_probs * SUM
+            actor_loss = actor_loss.mean()
+            critic_loss = k0_current_values * SUM
+            critic_loss = critic_loss.mean()
 
-            # Optimize the policy
-            self.policy.optimizer.zero_grad()
-            loss.backward()
-            # Clip gradient norm
-            th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-            self.policy.optimizer.step()
+            self.actor.optimizer.zero_grad()
+            actor_loss.backward()
+            th.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+            self.actor.optimizer.step()
+
+            self.critic.optimizer.zero_grad()
+            critic_loss.backward()
+            th.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            self.critic.optimizer.step()
+
+            losses.append(critic_loss.item() + actor_loss.item())
+            critic_losses.append(critic_loss.item())
+            actor_losses.append(actor_loss.item())
+            # policy_proximity_coeffs.append(policy_proximity_coeff.mean().item())
+            sums.append(SUM.mean().item())
 
         # Increase update counter
         self._n_updates += gradient_steps
 
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/loss", np.mean(losses))
-        self.logger.record("train/v_loss", np.mean(v_losses))
-        self.logger.record("train/p_loss", np.mean(p_losses))
+        self.logger.record("train/critic_loss", np.mean(critic_losses))
+        self.logger.record("train/actor_loss", np.mean(actor_losses))
+        self.logger.record("train/SUM", np.mean(sums))
 
     def learn(
         self: ACERSelf,
@@ -284,13 +322,13 @@ class ACER(OffPolicyAlgorithm):
         env: VecEnv,
         callback: BaseCallback,
         train_freq: TrainFreq,
-        replay_buffer: PiReplayBuffer,
+        replay_buffer: PiTrajectoryReplayBuffer,
         action_noise: Optional[ActionNoise] = None,
         learning_starts: int = 0,
         log_interval: Optional[int] = None,
     ) -> RolloutReturn:
         """
-        Collect experiences and store them into a ``PiReplayBuffer``.
+        Collect experiences and store them into a ``PiTrajectoryReplayBuffer``.
 
         :param env: The training environment
         :param callback: Callback that will be called at each step
@@ -374,10 +412,11 @@ class ACER(OffPolicyAlgorithm):
             with th.no_grad():
                 obs_t = th.Tensor(self._last_obs, device=self.device)
                 actions_t = th.Tensor(actions, device=self.device)
-                dist = self.policy.get_distribution(obs_t)
-                log_probs = dist.log_prob(
-                    actions_t
-                )  # ? check if sum_independent_dims() should really be called
+                log_probs = self.actor.log_prob_of_actions(obs_t, actions_t)
+                # dist = self.policy.get_distribution(obs_t)
+                # log_probs = dist.log_prob(
+                #     actions_t
+                # )  # ? check if sum_independent_dims() should really be called
             self._store_transition(
                 replay_buffer, buffer_actions, log_probs, new_obs, rewards, dones, infos
             )
@@ -420,7 +459,7 @@ class ACER(OffPolicyAlgorithm):
     # overwrites OffPolicyAlgorithm to store log_probs of actions
     def _store_transition(
         self,
-        replay_buffer: PiReplayBuffer,
+        replay_buffer: PiTrajectoryReplayBuffer,
         buffer_action: np.ndarray,
         log_probs: np.ndarray,
         new_obs: Union[np.ndarray, Dict[str, np.ndarray]],
