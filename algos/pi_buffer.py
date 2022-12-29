@@ -302,25 +302,26 @@ class PiTrajectoryReplayBuffer:
         action = action.reshape((self.n_envs, self.action_dim))
 
         # Copy to avoid modification by reference
-        self.observations[self.trajectory_pos, self.trajectory_idx] = np.array(
+        self.observations[self.trajectory_idx, self.trajectory_pos] = np.array(
             obs
         ).copy()
 
         if self.optimize_memory_usage:
-            self.observations[(self.pos + 1) % self.buffer_size] = np.array(
-                next_obs
-            ).copy()
+            raise NotImplementedError()
+            # self.observations[(self.pos + 1) % self.buffer_size] = np.array(
+            #     next_obs
+            # ).copy()
         else:
-            self.next_observations[self.trajectory_pos, self.trajectory_idx] = np.array(
+            self.next_observations[self.trajectory_idx, self.trajectory_pos] = np.array(
                 next_obs
             ).copy()
 
-        self.actions[self.trajectory_pos, self.trajectory_idx] = np.array(action).copy()
-        self.log_probs[self.trajectory_pos, self.trajectory_idx] = np.array(
+        self.actions[self.trajectory_idx, self.trajectory_pos] = np.array(action).copy()
+        self.log_probs[self.trajectory_idx, self.trajectory_pos] = np.array(
             log_prob
         ).copy()
-        self.rewards[self.trajectory_pos, self.trajectory_idx] = np.array(reward).copy()
-        self.dones[self.trajectory_pos, self.trajectory_idx] = np.array(done).copy()
+        self.rewards[self.trajectory_idx, self.trajectory_pos] = np.array(reward).copy()
+        self.dones[self.trajectory_idx, self.trajectory_pos] = np.array(done).copy()
 
         self.trajectory_pos += 1
         if self.trajectory_pos == self.trajectory_size:
@@ -345,7 +346,7 @@ class PiTrajectoryReplayBuffer:
             to normalize the observations/rewards when sampling
         :return:
         """
-        assert batch_size <= self.num_trajectories
+        # assert batch_size <= self.num_trajectories
         assert trajectory_size <= self.trajectory_size
 
         if self.optimize_memory_usage:
