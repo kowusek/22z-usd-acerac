@@ -6,6 +6,7 @@ import torch as th
 from torch import nn
 
 from stable_baselines3.common.distributions import (
+    Distribution,
     SquashedDiagGaussianDistribution,
     StateDependentNoiseDistribution,
 )
@@ -202,6 +203,10 @@ class Actor(BasePolicy):
         dist = self.action_dist.proba_distribution(mean_actions, log_std, **kwargs)
         return dist.log_prob(actions)
 
+    def get_distribution(self, obs: th.Tensor) -> Distribution:
+        mean_actions, log_std, kwargs = self.get_action_dist_params(obs)
+        return self.action_dist.proba_distribution(mean_actions, log_std, **kwargs)
+
     def _predict(
         self, observation: th.Tensor, deterministic: bool = False
     ) -> th.Tensor:
@@ -244,7 +249,7 @@ class ACERPolicy(BasePolicy):
         self,
         observation_space: gym.spaces.Space,
         action_space: gym.spaces.Space,
-        lr_schedule: Schedule,
+        lr_schedule: Union[Schedule, Tuple[Schedule, Schedule]],
         net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
         activation_fn: Type[nn.Module] = nn.ReLU,
         use_sde: bool = False,
@@ -315,9 +320,14 @@ class ACERPolicy(BasePolicy):
         self._build(lr_schedule)
 
     def _build(self, lr_schedule: Schedule) -> None:
+        if isinstance(lr_schedule, tuple):
+            actor_schedule, critic_schedule = lr_schedule
+        else:
+            actor_schedule, critic_schedule = lr_schedule, lr_schedule
+
         self.actor = self.make_actor()
         self.actor.optimizer = self.optimizer_class(
-            self.actor.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs
+            self.actor.parameters(), lr=actor_schedule(1), **self.optimizer_kwargs
         )
 
         if self.share_features_extractor:
@@ -336,7 +346,7 @@ class ACERPolicy(BasePolicy):
             )
 
         self.critic.optimizer = self.optimizer_class(
-            critic_parameters, lr=lr_schedule(1), **self.optimizer_kwargs
+            critic_parameters, lr=critic_schedule(1), **self.optimizer_kwargs
         )
 
     def _get_constructor_parameters(self) -> Dict[str, Any]:
@@ -421,3 +431,22 @@ class ACERPolicy(BasePolicy):
         """
         features = self.critic_extractor(obs.float())
         return self.critic(features)
+
+    def evaluate_actions(self, obs: th.Tensor, actions: th.Tensor) -> th.Tensor:
+        """
+        Evaluate actions according to the current policy,
+        given the observations.
+        Returns the critic values of the observations and the actor log_probs of the actions.
+
+        :param obs:
+        :param actions:
+        :return: estimated value, log likelihood of taking those actions
+            and entropy (None, only for compatibility with ActorCriticPolicy)
+            of the action distribution.
+        """
+        log_probs = self.actor.log_prob_of_actions(obs, actions)
+        values = self.predict_values(obs)
+        return values, log_probs, None
+
+    def get_distribution(self, obs: th.Tensor) -> Distribution:
+        return self.actor.get_distribution(obs)
