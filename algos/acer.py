@@ -1,5 +1,6 @@
 import warnings
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
+import math
 
 import gym
 import numpy as np
@@ -46,42 +47,39 @@ class ACER(OffPolicyAlgorithm):
 
     !TODO: code copied from DQM. The params prepended with `--` are not yet tested and may not be needed
 
-    --:param policy: The policy model to use (MlpPolicy, CnnPolicy, ...)
-    --:param env: The environment to learn from (if registered in Gym, can be str)
+    :param policy: The policy model to use (MlpPolicy, CnnPolicy, ...)
+    :param env: The environment to learn from (if registered in Gym, can be str)
     :param learning_rate: The learning rate, it can be a function
         of the current progress remaining (from 1 to 0)
     :param buffer_size: size of the replay buffer
     --:param learning_starts: how many steps of the model to collect transitions for before learning starts
     :param batch_size: Minibatch size for each gradient update
-    --:param tau: the soft update coefficient ("Polyak update", between 0 and 1) default 1 for hard update
-    --:param gamma: the discount factor
+    :param tau: the soft update coefficient ("Polyak update", between 0 and 1) default 1 for hard update
+    :param gamma: the discount factor
     --:param train_freq: Update the model every ``train_freq`` steps. Alternatively pass a tuple of frequency and unit
         like ``(5, "step")`` or ``(2, "episode")``.
-    --:param gradient_steps: How many gradient steps to do after each rollout (see ``train_freq``)
+    :param gradient_steps: How many gradient steps to do after each rollout (see ``train_freq``)
         Set to ``-1`` means to do as many gradient steps as steps done in the environment
         during the rollout.
-    --:param replay_buffer_class: Replay buffer class to use (for instance ``HerReplayBuffer``).
+    :param replay_buffer_class: Replay buffer class to use (for instance ``HerReplayBuffer``).
         If ``None``, it will be automatically selected.
-    --:param replay_buffer_kwargs: Keyword arguments to pass to the replay buffer on creation.
+    :param replay_buffer_kwargs: Keyword arguments to pass to the replay buffer on creation.
     --:param optimize_memory_usage: Enable a memory efficient variant of the replay buffer
         at a cost of more complexity.
         See https://github.com/DLR-RM/stable-baselines3/issues/37#issuecomment-637501195
-    --:param exploration_fraction: fraction of entire training period over which the exploration rate is reduced
-    --:param exploration_initial_eps: initial value of random action probability
-    --:param exploration_final_eps: final value of random action probability
-    --:param max_grad_norm: The maximum value for the gradient clipping
-    --:param tensorboard_log: the log location for tensorboard (if None, no logging)
+    :param max_grad_norm: The maximum value for the gradient clipping
+    :param tensorboard_log: the log location for tensorboard (if None, no logging)
     --:param create_eval_env: Whether to create a second environment that will be
         used for evaluating the agent periodically (Only available when passing string for the environment).
         Caution, this parameter is deprecated and will be removed in the future.
         Please use `EvalCallback` or a custom Callback instead.
-    --:param policy_kwargs: additional arguments to be passed to the policy on creation
-    --:param verbose: Verbosity level: 0 for no output, 1 for info messages (such as device or wrappers used), 2 for
+    :param policy_kwargs: additional arguments to be passed to the policy on creation
+    :param verbose: Verbosity level: 0 for no output, 1 for info messages (such as device or wrappers used), 2 for
         debug messages
-    --:param seed: Seed for the pseudo random generators
-    --:param device: Device (cpu, cuda, ...) on which the code should be run.
+    :param seed: Seed for the pseudo random generators
+    :param device: Device (cpu, cuda, ...) on which the code should be run.
         Setting it to auto, the code will be run on the GPU if possible.
-    --:param _init_setup_model: Whether or not to build the network at the creation of the instance
+    :param _init_setup_model: Whether or not to build the network at the creation of the instance
     """
 
     policy_aliases: Dict[str, Type[BasePolicy]] = {
@@ -97,13 +95,13 @@ class ACER(OffPolicyAlgorithm):
         self,
         policy: Union[str, Type[ActorCriticPolicy]],
         env: Union[GymEnv, str],
-        lr_actor: Union[float, Schedule] = 1e-4,
-        lr_critic: Union[float, Schedule] = 1e-4,  # only usable in the ACERPolicy
-        buffer_num_trajectories: int = 2,
+        lr_actor: Union[float, Schedule] = 1e-3,
+        lr_critic: Union[float, Schedule] = 1e-3,  # only usable in the ACERPolicy
+        buffer_num_trajectories: int = 10,
         buffer_trajectory_size: int = 1000,  # epizode len
-        learning_starts: int = 1000,
+        learning_starts: int = 10000,
         batch_size: int = 32,
-        buffer_sample_trajectory_size: int = 8,
+        buffer_sample_trajectory_size: int = 4,
         alpha: float = 0.3,  # SUM component
         tau: float = 3.00,  # min{policy_frac, b}; b = tau
         gamma: float = 0.99,
@@ -114,18 +112,21 @@ class ACER(OffPolicyAlgorithm):
         ] = PiTrajectoryReplayBuffer,
         replay_buffer_kwargs: Optional[Dict[str, Any]] = None,
         optimize_memory_usage: bool = False,
-        exploration_fraction: float = 0.1,
-        exploration_initial_eps: float = 1.0,
-        exploration_final_eps: float = 0.05,
-        max_grad_norm: float = 1.0,
+        max_grad_norm: float = 3.0,
         tensorboard_log: Optional[str] = None,
         create_eval_env: bool = False,
+        policy_actor_std: float = 0.4,
         policy_kwargs: Optional[Dict[str, Any]] = None,
         verbose: int = 0,
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
     ):
+
+        if policy_kwargs is None:
+            policy_kwargs = {"log_std_init": math.log(policy_actor_std)}
+        else:
+            policy_kwargs["log_std_init"] = policy_actor_std
 
         super().__init__(
             policy,
@@ -168,28 +169,21 @@ class ACER(OffPolicyAlgorithm):
         self.lr_actor = lr_actor
         self.lr_critic = lr_critic
         self.alpha = alpha
-        self.exploration_initial_eps = exploration_initial_eps
-        self.exploration_final_eps = exploration_final_eps
-        self.exploration_fraction = exploration_fraction
         # For updating the target network with multiple envs:
         self._n_calls = 0
         self.max_grad_norm = max_grad_norm
         # "epsilon" for the epsilon-greedy exploration
         self.exploration_rate = 0.0
-        # Linear schedule will be defined in `_setup_model()`
-        self.exploration_schedule = None
 
         if _init_setup_model:
             self._setup_model()
 
+        # lock std
+        self.policy.log_std.requires_grad = False
+
     def _setup_model(self) -> None:
         super()._setup_model()
         self._create_aliases()
-        self.exploration_schedule = get_linear_fn(
-            self.exploration_initial_eps,
-            self.exploration_final_eps,
-            self.exploration_fraction,
-        )
 
     def _setup_lr_schedule(self) -> None:
         """Transform to callable if needed."""
@@ -218,7 +212,7 @@ class ACER(OffPolicyAlgorithm):
         losses = []
         actor_losses, critic_losses = [], []
         sums = []
-        action_mean_losses = []
+        action_mean_losses, action_stds = [], []
         for _ in range(gradient_steps):
             # Sample replay buffer
             replay_data = self.replay_buffer.sample(
@@ -260,7 +254,6 @@ class ACER(OffPolicyAlgorithm):
                 current_log_probs = current_log_probs.unsqueeze(-1)
 
                 if k == 0:
-                    k0_current_dist = current_dist
                     k0_current_log_probs = current_log_probs
                     k0_current_values = current_values
 
@@ -297,17 +290,18 @@ class ACER(OffPolicyAlgorithm):
                     )
                     SUM += (self.alpha**k) * advantage * clamped_pi_coef
 
-            # k0_current_dist = self.policy.ge t_distribution(
-            #     replay_data.observations[:, 0]
-            # )
-            # dist_mean = th.mean(k0_current_dist.mode(), -1)
-            # action_mean_loss = (
-            #     th.square(th.minimum(th.zeros_like(dist_mean), th.abs(dist_mean) - 1.0))
-            #     * 0.001
-            # )
+            # Keep the absolute mean of the gaussian action distribution within 1.0, since that's the range of the action space in cheetah.
+            k0_current_dist = self.policy.get_distribution(
+                replay_data.observations[:, 0]
+            )
+            dist_mean = th.mean(k0_current_dist.mode(), -1)
+            action_mean_loss = (
+                th.square(th.maximum(th.abs(dist_mean) - 1.0, th.zeros_like(dist_mean)))
+                * 0.1
+            )
 
-            # actor_loss = k0_current_log_probs * SUM + action_mean_loss
-            actor_loss = k0_current_log_probs * SUM
+            actor_loss = k0_current_log_probs * SUM + action_mean_loss
+            # actor_loss = k0_current_log_probs * SUM
             actor_loss = actor_loss.mean()
             critic_loss = k0_current_values * SUM
             critic_loss = critic_loss.mean()
@@ -338,7 +332,8 @@ class ACER(OffPolicyAlgorithm):
             critic_losses.append(critic_loss.item())
             actor_losses.append(actor_loss.item())
             sums.append(SUM.mean().item())
-            # action_mean_losses.append(action_mean_loss.mean().item())
+            action_mean_losses.append(action_mean_loss.mean().item())
+            action_stds.append(th.mean(k0_current_dist.distribution.stddev).item())
 
         # Increase update counter
         self._n_updates += gradient_steps
@@ -348,7 +343,8 @@ class ACER(OffPolicyAlgorithm):
         self.logger.record("train/critic_loss", np.mean(critic_losses))
         self.logger.record("train/actor_loss", np.mean(actor_losses))
         self.logger.record("train/SUM", np.mean(sums))
-        # self.logger.record("train/action_mean_loss", np.mean(action_mean_losses))
+        self.logger.record("train/action_mean_loss", np.mean(action_mean_losses))
+        self.logger.record("train/action_std", np.mean(action_stds))
 
     def check_modules_not_nan(self, m: nn.Module):
         if hasattr(m, "data"):
