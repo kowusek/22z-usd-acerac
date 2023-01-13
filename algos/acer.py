@@ -37,6 +37,8 @@ from stable_baselines3.dqn.policies import (
     MultiInputPolicy,
 )
 
+from algos.policy2 import ActorCriticAcerV2
+
 
 ACERSelf = TypeVar("ACERSelf", bound="ACER")
 
@@ -44,8 +46,6 @@ ACERSelf = TypeVar("ACERSelf", bound="ACER")
 class ACER(OffPolicyAlgorithm):
     """
     The ACER (Actor-Critic with Experience Replay) model class, https://arxiv.org/abs/1611.01224
-
-    !TODO: code copied from DQM. The params prepended with `--` are not yet tested and may not be needed
 
     :param policy: The policy model to use (MlpPolicy, CnnPolicy, ...)
     :param env: The environment to learn from (if registered in Gym, can be str)
@@ -83,17 +83,17 @@ class ACER(OffPolicyAlgorithm):
     """
 
     policy_aliases: Dict[str, Type[BasePolicy]] = {
-        "MlpPolicy": ActorCriticPolicy,
+        "MlpPolicy": ActorCriticAcerV2,
     }
 
-    policy: ActorCriticPolicy
+    policy: ActorCriticAcerV2
     # actor: Actor
     critic: nn.Module
     replay_buffer: PiTrajectoryReplayBuffer
 
     def __init__(
         self,
-        policy: Union[str, Type[ActorCriticPolicy]],
+        policy: Union[str, Type[ActorCriticAcerV2]],
         env: Union[GymEnv, str],
         lr_actor: Union[float, Schedule] = 1e-3,
         lr_critic: Union[float, Schedule] = 1e-3,  # only usable in the ACERPolicy
@@ -302,32 +302,32 @@ class ACER(OffPolicyAlgorithm):
 
             actor_loss = k0_current_log_probs * SUM + action_mean_loss
             # actor_loss = k0_current_log_probs * SUM
-            actor_loss = actor_loss.mean()
+            actor_loss = -actor_loss.mean()
             critic_loss = k0_current_values * SUM
-            critic_loss = critic_loss.mean()
+            critic_loss = -critic_loss.mean()
 
-            loss = actor_loss + critic_loss
-            self.policy.optimizer.zero_grad()
-            loss.backward()
-            th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-            self.policy.optimizer.step()
+            # self.policy.optimizer.zero_grad()
+            # loss.backward()
+            # th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            # self.policy.optimizer.step()
 
-            # self.policy.actor.optimizer.zero_grad()
-            # actor_loss.backward()
-            # th.nn.utils.clip_grad_norm_(
-            #     self.policy.actor.parameters(), self.max_grad_norm
-            # )
-            # self.policy.actor.optimizer.step()
+            self.policy.critic.optimizer.zero_grad()
+            critic_loss.backward()
+            th.nn.utils.clip_grad_norm_(
+                self.policy.critic.parameters(), self.max_grad_norm
+            )
+            self.policy.critic.optimizer.step()
 
-            # self.policy.critic.optimizer.zero_grad()
-            # critic_loss.backward()
-            # th.nn.utils.clip_grad_norm_(
-            #     self.policy.critic.parameters(), self.max_grad_norm
-            # )
-            # self.policy.critic.optimizer.step()
+            self.policy.actor.optimizer.zero_grad()
+            actor_loss.backward()
+            th.nn.utils.clip_grad_norm_(
+                self.policy.actor.parameters(), self.max_grad_norm
+            )
+            self.policy.actor.optimizer.step()
 
             # self.check_modules_not_nan(self.policy)
 
+            loss = actor_loss + critic_loss
             losses.append(loss.item())
             critic_losses.append(critic_loss.item())
             actor_losses.append(actor_loss.item())
@@ -366,7 +366,7 @@ class ACER(OffPolicyAlgorithm):
             "train/lr_critic", self.critic_lr_schedule(self._current_progress_remaining)
         )
 
-        if self.policy_class == ACERPolicy:
+        if self.policy_class == ACERPolicy or self.policy_class == ActorCriticAcerV2:
             update_learning_rate(
                 self.policy.actor.optimizer,
                 self.actor_lr_schedule(self._current_progress_remaining),
