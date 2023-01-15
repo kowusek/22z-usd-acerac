@@ -93,8 +93,10 @@ class PiReplayBuffer(ReplayBuffer):
         self.actions = np.zeros(
             (self.buffer_size, self.n_envs, self.action_dim), dtype=action_space.dtype
         )
+        self.log_probs = np.zeros(
+            (self.buffer_size, self.n_envs, self.action_dim), dtype=np.float32
+        )
 
-        self.log_probs = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         # Handle timeouts termination properly if needed
@@ -167,7 +169,7 @@ class PiReplayBuffer(ReplayBuffer):
         data = (
             self._normalize_obs(self.observations[batch_inds, env_indices, :], env),
             self.actions[batch_inds, env_indices, :],
-            self.log_probs[batch_inds, env_indices],
+            self.log_probs[batch_inds, env_indices, :],
             next_obs,
             # Only use dones that are not due to timeouts
             # deactivated by default (timeouts is initialized as an array of False)
@@ -256,8 +258,8 @@ class PiTrajectoryReplayBuffer:
         self.actions = np.zeros(
             buffer_part_shape + (self.action_dim,), dtype=action_space.dtype
         )
+        self.log_probs = np.zeros(buffer_part_shape + (self.action_dim,), dtype=np.float32)
 
-        self.log_probs = np.zeros(buffer_part_shape, dtype=np.float32)
         self.rewards = np.zeros(buffer_part_shape, dtype=np.float32)
         self.dones = np.zeros(buffer_part_shape, dtype=np.float32)
 
@@ -426,7 +428,7 @@ class PiTrajectoryReplayBuffer:
                 env,
             ),
             self.actions[trajectory_inds, trajectory_positions, env_indices, :],
-            self.log_probs[trajectory_inds, trajectory_positions, env_indices],
+            self.log_probs[trajectory_inds, trajectory_positions, env_indices, :],
             next_obs,
             (self.dones[trajectory_inds, trajectory_positions, env_indices])[
                 ..., np.newaxis

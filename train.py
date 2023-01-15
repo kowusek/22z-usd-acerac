@@ -15,9 +15,6 @@ from wandb.integration.sb3 import WandbCallback
 from algos.acer import ACER
 
 if __name__ == "__main__":
-    # th.autograd.set_detect_anomaly(True)
-    # np.seterr(all="raise")
-
     wandb_run = wandb.init(
         project="usd_acer",
         sync_tensorboard=True,
@@ -26,10 +23,10 @@ if __name__ == "__main__":
     )
 
     env_id = "HalfCheetah-v3"
-    num_cpu = 6  # Number of processes to use
+    num_cpu = 1  # Number of processes to use
     # Create the vectorized environment
 
-    seed = 1
+    seed = 0
 
     random.seed(seed)
     np.random.seed(seed)
@@ -50,8 +47,8 @@ if __name__ == "__main__":
     model.learn(total_timesteps=1_000_000, callback=WandbCallback(gradient_save_freq=2))
     wandb_run.finish()
 
-    # obs = env.reset()
-    # for _ in range(1000):
-    #     action, _states = model.predict(obs)
-    #     obs, rewards, dones, info = env.step(action)
-    #     env.render()
+    obs = env.reset()
+    for _ in range(1000):
+        action, _states = model.predict(obs)
+        obs, rewards, dones, info = env.step(action)
+        env.render()

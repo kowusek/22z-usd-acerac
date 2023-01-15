@@ -87,8 +87,6 @@ class ACER(OffPolicyAlgorithm):
     }
 
     policy: ActorCriticAcerV2
-    # actor: Actor
-    critic: nn.Module
     replay_buffer: PiTrajectoryReplayBuffer
 
     def __init__(
@@ -97,11 +95,11 @@ class ACER(OffPolicyAlgorithm):
         env: Union[GymEnv, str],
         lr_actor: Union[float, Schedule] = 1e-3,
         lr_critic: Union[float, Schedule] = 1e-3,  # only usable in the ACERPolicy
-        buffer_num_trajectories: int = 10,
+        buffer_num_trajectories: int = 2,
         buffer_trajectory_size: int = 1000,  # epizode len
-        learning_starts: int = 10000,
+        learning_starts: int = 1000,
         batch_size: int = 32,
-        buffer_sample_trajectory_size: int = 4,
+        buffer_sample_trajectory_size: int = 1,
         alpha: float = 0.3,  # SUM component
         tau: float = 3.00,  # min{policy_frac, b}; b = tau
         gamma: float = 0.99,
@@ -226,10 +224,16 @@ class ACER(OffPolicyAlgorithm):
                 self.policy.reset_noise()
 
             rolling_pi_coef = th.full(
-                (self.batch_size, 1), 1.0, dtype=th.float32, device=self.device
+                (self.batch_size, self.action_space.shape[0]),
+                1.0,
+                dtype=th.float32,
+                device=self.device,
             )
             SUM = th.full(
-                (self.batch_size, 1), 0.0, dtype=th.float32, device=self.device
+                (self.batch_size, self.action_space.shape[0]),
+                0.0,
+                dtype=th.float32,
+                device=self.device,
             )
 
             # The second dimension of the replay data tensors is the in-trajectory index.
@@ -247,11 +251,11 @@ class ACER(OffPolicyAlgorithm):
                 # )
 
                 current_dist = self.policy.get_distribution(observations)
-                current_log_probs = current_dist.log_prob(actions)
+                current_log_probs = current_dist.distribution.log_prob(actions)
                 current_values = self.policy.predict_values(observations)
 
-                log_probs = log_probs.unsqueeze(-1)
-                current_log_probs = current_log_probs.unsqueeze(-1)
+                # log_probs = log_probs.unsqueeze(-1)
+                # current_log_probs = current_log_probs.unsqueeze(-1)
 
                 if k == 0:
                     k0_current_log_probs = current_log_probs
@@ -288,23 +292,21 @@ class ACER(OffPolicyAlgorithm):
                             device=self.device,
                         ),
                     )
-                    SUM += (self.alpha**k) * advantage * clamped_pi_coef
+                    SUM += (self.alpha**k) * clamped_pi_coef * advantage
 
             # Keep the absolute mean of the gaussian action distribution within 1.0, since that's the range of the action space in cheetah.
             k0_current_dist = self.policy.get_distribution(
                 replay_data.observations[:, 0]
             )
-            dist_mean = th.mean(k0_current_dist.mode(), -1)
+            dist_mean = k0_current_dist.mode()
             action_mean_loss = (
-                th.square(th.maximum(th.abs(dist_mean) - 1.0, th.zeros_like(dist_mean)))
-                * 0.1
+                th.maximum(th.abs(dist_mean) - 1.0, th.zeros_like(dist_mean)) * 10000.0
             )
 
-            actor_loss = k0_current_log_probs * SUM + action_mean_loss
-            # actor_loss = k0_current_log_probs * SUM
-            actor_loss = -actor_loss.mean()
-            critic_loss = k0_current_values * SUM
-            critic_loss = -critic_loss.mean()
+            actor_loss = -k0_current_log_probs * SUM + action_mean_loss
+            actor_loss = actor_loss.mean()
+            critic_loss = -k0_current_values * SUM
+            critic_loss = critic_loss.mean()
 
             # self.policy.optimizer.zero_grad()
             # loss.backward()
@@ -508,7 +510,7 @@ class ACER(OffPolicyAlgorithm):
                 actions_t = th.Tensor(actions, device=self.device)
                 # log_probs = self.actor.log_prob_of_actions(obs_t, actions_t)
                 dist = self.policy.get_distribution(obs_t)
-                log_probs = dist.log_prob(
+                log_probs = dist.distribution.log_prob(
                     actions_t
                 )  # ? check if sum_independent_dims() should really be called
             self._store_transition(
