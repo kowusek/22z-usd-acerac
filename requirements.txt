@@ -1,0 +1,8 @@
+ale_py==0.7.4
+gym==0.26.2
+numpy==1.19.2
+psutil==5.9.0
+stable_baselines3==1.6.2
+torch==1.11.0
+mujoco-py==2.1.2.14
+wandb==0.13.3

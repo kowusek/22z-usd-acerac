@@ -11,7 +11,7 @@ ENV LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/mujoco/mujoco210/bin"
 RUN wget https://mujoco.org/download/mujoco210-linux-x86_64.tar.gz && mkdir /mujoco && tar -xvzf ./mujoco210-linux-x86_64.tar.gz -C /mujoco
 RUN python -m pip install mujoco-py==2.1.2.14
 RUN python -m pip install stable-baselines3==1.6.2
-RUN python -m pip install wandb
+RUN python -m pip install wandb==0.13.3
 
 COPY docker_mujoco_ext_build.py /docker_mujoco_ext_build.py
 RUN python /docker_mujoco_ext_build.py
