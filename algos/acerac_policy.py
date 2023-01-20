@@ -3,6 +3,7 @@
 import collections
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
+import math
 
 import gym
 import numpy as np
@@ -25,7 +26,7 @@ from stable_baselines3.common.type_aliases import Schedule
 from stable_baselines3.common.policies import BasePolicy
 
 
-class ActorCriticAcerV2(BasePolicy):
+class AceracPolicy(BasePolicy):
     """
     Policy class for actor-critic algorithms (has both policy and value prediction).
     Used by A2C, PPO and the likes.
@@ -38,25 +39,14 @@ class ActorCriticAcerV2(BasePolicy):
     :param ortho_init: Whether to use or not orthogonal initialization
     :param use_sde: Whether to use State Dependent Exploration or not
     :param log_std_init: Initial value for the log standard deviation
-    :param full_std: Whether to use (n_features x n_actions) parameters
-        for the std instead of only (n_features,) when using gSDE
-    :param sde_net_arch: Network architecture for extracting features
-        when using gSDE. If None, the latent features from the policy will be used.
-        Pass an empty list to use the states as features.
-    :param use_expln: Use ``expln()`` function instead of ``exp()`` to ensure
-        a positive standard deviation (cf paper). It allows to keep variance
-        above zero and prevent it from growing too fast. In practice, ``exp()`` is usually enough.
-    :param squash_output: Whether to squash the output using a tanh function,
-        this allows to ensure boundaries when using gSDE.
     :param features_extractor_class: Features extractor to use.
     :param features_extractor_kwargs: Keyword arguments
         to pass to the features extractor.
-    :param normalize_images: Whether to normalize images or not,
-         dividing by 255.0 (True by default)
     :param optimizer_class: The optimizer to use,
         ``th.optim.Adam`` by default
     :param optimizer_kwargs: Additional keyword arguments,
         excluding the learning rate, to pass to the optimizer
+    :param alpha: Action noise coefficient from the paper.
     """
 
     actor: nn.Module
@@ -66,15 +56,15 @@ class ActorCriticAcerV2(BasePolicy):
         self,
         observation_space: gym.spaces.Space,
         action_space: gym.spaces.Space,
-        lr_schedule: Schedule,
+        lr_schedule: Union[Schedule, Tuple[Schedule, Schedule]],
         net_arch: Optional[List[Union[int, Dict[str, List[int]]]]] = None,
         activation_fn: Type[nn.Module] = nn.Tanh,
         ortho_init: bool = True,
-        use_sde: bool = False,
         log_std_init: float = 0.0,
-        full_std: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        alpha: float = 0.5,
+        noise_c: float = 0.3
     ):
 
         if optimizer_kwargs is None:
@@ -100,21 +90,19 @@ class ActorCriticAcerV2(BasePolicy):
 
         self.log_std_init = log_std_init
         dist_kwargs = None
-        # Keyword arguments for gSDE distribution
-        if use_sde:
-            dist_kwargs = {
-                "full_std": full_std,
-                "learn_features": False,
-            }
 
-        self.use_sde = use_sde
         self.dist_kwargs = dist_kwargs
 
         # Action distribution
         self.action_dist = make_proba_distribution(
-            action_space, use_sde=use_sde, dist_kwargs=dist_kwargs
+            action_space, dist_kwargs=dist_kwargs
         )
+        self.noise_c = th.diag(th.ones(self.action_dist.action_dim) * noise_c)
+        self.noise_dist = th.distributions.MultivariateNormal(th.zeros(self.action_dist.action_dim), self.noise_c)
+        self.action_dist.requires_grad = False
         self.log_std = th.ones(self.action_dist.action_dim) * log_std_init
+        self.alpha = alpha
+        self.alpha_sqrt = math.sqrt(1 - alpha**2)
 
         self._build(lr_schedule)
 
@@ -160,19 +148,31 @@ class ActorCriticAcerV2(BasePolicy):
         :param lr_schedule: Learning rate schedule
             lr_schedule(1) is the initial learning rate
         """
+        if isinstance(lr_schedule, tuple):
+            actor_schedule, critic_schedule = lr_schedule
+        else:
+            actor_schedule, critic_schedule = lr_schedule, lr_schedule
+
         self.actor = nn.Sequential(
             nn.Linear(get_flattened_obs_dim(self.observation_space), 64),
             nn.Tanh(),
             nn.Linear(64, self.action_dist.action_dim),
         )
         self.actor.optimizer = self.optimizer_class(
-            self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs
+            self.actor.parameters(), lr=actor_schedule(1), **self.optimizer_kwargs
         )
 
         self.critic = nn.Sequential(
-            nn.Linear(get_flattened_obs_dim(self.observation_space), 64),
+            nn.Linear(
+                get_flattened_obs_dim(self.observation_space)
+                + self.action_dist.action_dim,
+                64,
+            ),
             nn.Tanh(),
             nn.Linear(64, 1),
+        )
+        self.critic.optimizer = self.optimizer_class(
+            self.critic.parameters(), lr=critic_schedule(1), **self.optimizer_kwargs
         )
 
         # Init weights: use orthogonal initialization
@@ -185,13 +185,6 @@ class ActorCriticAcerV2(BasePolicy):
             }
             for module, gain in module_gains.items():
                 module.apply(partial(self.init_weights, gain=gain))
-
-        self.actor.optimizer = self.optimizer_class(
-            self.actor.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs
-        )
-        self.critic.optimizer = self.optimizer_class(
-            self.critic.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs
-        )
 
     def forward(
         self, obs: th.Tensor, deterministic: bool = False
@@ -236,19 +229,77 @@ class ActorCriticAcerV2(BasePolicy):
             raise ValueError("Invalid action distribution")
 
     def _predict(
-        self, observation: th.Tensor, deterministic: bool = False
-    ) -> th.Tensor:
+        self, observation: th.Tensor, prev_noise: th.Tensor, episode_start:th.Tensor, deterministic: bool = False
+    ) -> Tuple[th.Tensor, th.Tensor]:
         """
         Get the action according to the policy for a given observation.
 
         :param observation:
+        :param prev_noise: Noise of the previous action.
+        :param episode_start: Bool tensor marking whether the obervation is first in the episode.
         :param deterministic: Whether to use stochastic or deterministic actions
-        :return: Taken action according to the policy
+        :return: Taken action according to the policy along with the used noise.
         """
+        action_shape = observation.shape
+        action_shape[-1] = self.action_dist.action_dim
+        noise = self.noise_dist.sample(action_shape)
+
+        #TODO: Check if applying the calculation on the whole tensor and only later overwriting start values doesn't speed up the algo.
+        noise[~episode_start] = self.alpha * prev_noise[~episode_start] + self.alpha_sqrt * noise[~episode_start]
+
         observation = observation.type(th.float32)
-        return self.get_distribution(observation).get_actions(
+        actions = self.get_distribution(observation).get_actions(
             deterministic=deterministic
         )
+        return actions + noise
+
+    def predict(
+        self,
+        observation: Union[np.ndarray, Dict[str, np.ndarray]],
+        state: Optional[Tuple[np.ndarray, ...]] = None,
+        episode_start: Optional[np.ndarray] = None,
+        deterministic: bool = False,
+    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+        """
+        Get the policy action from an observation (and optional hidden state).
+        Includes sugar-coating to handle different observations (e.g. normalizing images).
+
+        :param observation: the input observation
+        :param state: The last hidden states (can be None, used in recurrent policies)
+        :param episode_start: The last masks (can be None, used in recurrent policies)
+            this correspond to beginning of episodes,
+            where the hidden states of the RNN must be reset.
+        :param deterministic: Whether or not to return deterministic actions.
+        :return: the model's action and the next hidden state
+            (used in recurrent policies)
+        """
+        self.set_training_mode(False)
+
+        observation, vectorized_env = self.obs_to_tensor(observation)
+
+        with th.no_grad():
+            actions, state = self._predict(
+                observation, prev_noise=state, episode_start=episode_start, deterministic=deterministic
+            )
+        # Convert to numpy, and reshape to the original action shape
+        actions = actions.cpu().numpy().reshape((-1,) + self.action_space.shape)
+
+        if isinstance(self.action_space, gym.spaces.Box):
+            if self.squash_output:
+                # Rescale to proper domain when using squashing
+                actions = self.unscale_action(actions)
+            else:
+                # Actions could be on arbitrary scale, so clip the actions to avoid
+                # out of bound error (e.g. if sampling from a Gaussian distribution)
+                actions = np.clip(
+                    actions, self.action_space.low, self.action_space.high
+                )
+
+        # Remove batch dimension if needed
+        if not vectorized_env:
+            actions = actions.squeeze(axis=0)
+
+        return actions, state
 
     def evaluate_actions(
         self, obs: th.Tensor, actions: th.Tensor

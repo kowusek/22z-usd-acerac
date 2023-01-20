@@ -1,6 +1,7 @@
 import warnings
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 import math
+from copy import deepcopy
 
 import gym
 import numpy as np
@@ -8,9 +9,6 @@ import torch as th
 from torch import nn
 from torch.nn import functional as F
 
-from copy import deepcopy
-from algos.pi_buffer import PiReplayBuffer, PiTrajectoryReplayBuffer
-from algos.policy import ACERPolicy, Actor
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.noise import ActionNoise, VectorizedActionNoise
@@ -31,13 +29,9 @@ from stable_baselines3.common.utils import (
     get_schedule_fn,
 )
 from stable_baselines3.common.vec_env import VecEnv
-from stable_baselines3.dqn.policies import (
-    CnnPolicy,
-    MlpPolicy,
-    MultiInputPolicy,
-)
 
-from algos.policy2 import ActorCriticAcerV2
+from algos.pi_buffer import PiTrajectoryReplayBuffer
+from algos.policy import ACERPolicy
 
 
 ACERSelf = TypeVar("ACERSelf", bound="ACER")
@@ -45,18 +39,22 @@ ACERSelf = TypeVar("ACERSelf", bound="ACER")
 
 class ACER(OffPolicyAlgorithm):
     """
-    The ACER (Actor-Critic with Experience Replay) model class, https://arxiv.org/abs/1611.01224
+    The ACER (Actor-Critic with Experience Replay) model class, DOI:10.1016/j.neunet.2009.05.011
 
     :param policy: The policy model to use (MlpPolicy, CnnPolicy, ...)
     :param env: The environment to learn from (if registered in Gym, can be str)
-    :param learning_rate: The learning rate, it can be a function
-        of the current progress remaining (from 1 to 0)
-    :param buffer_size: size of the replay buffer
-    --:param learning_starts: how many steps of the model to collect transitions for before learning starts
+    :param lr_actor: The learning rate, it can be a function of the current progress remaining (from 1 to 0)
+    :param lr_critic: The learning rate, it can be a function of the current progress remaining (from 1 to 0)
+    :param buffer_num_epizodes: Number of constant-size epizodes stored by the buffer
+    :param buffer_epizode_size: Size of an epizode. All epizodes have to have equal lengths
+    :param learning_starts: how many steps of the model to collect transitions for before learning starts
     :param batch_size: Minibatch size for each gradient update
-    :param tau: the soft update coefficient ("Polyak update", between 0 and 1) default 1 for hard update
+    :param alpha:
+    :param tau: the hard update coefficient; min{policy_frac, b}; b = tau
     :param gamma: the discount factor
-    --:param train_freq: Update the model every ``train_freq`` steps. Alternatively pass a tuple of frequency and unit
+    :param action_out_of_counds_loss_multiplier: multiplier of the loss for having the mean of the action distribution
+        outside of the action-space bounds.
+    :param train_freq: Update the model every ``train_freq`` steps. Alternatively pass a tuple of frequency and unit
         like ``(5, "step")`` or ``(2, "episode")``.
     :param gradient_steps: How many gradient steps to do after each rollout (see ``train_freq``)
         Set to ``-1`` means to do as many gradient steps as steps done in the environment
@@ -64,15 +62,9 @@ class ACER(OffPolicyAlgorithm):
     :param replay_buffer_class: Replay buffer class to use (for instance ``HerReplayBuffer``).
         If ``None``, it will be automatically selected.
     :param replay_buffer_kwargs: Keyword arguments to pass to the replay buffer on creation.
-    --:param optimize_memory_usage: Enable a memory efficient variant of the replay buffer
-        at a cost of more complexity.
-        See https://github.com/DLR-RM/stable-baselines3/issues/37#issuecomment-637501195
     :param max_grad_norm: The maximum value for the gradient clipping
     :param tensorboard_log: the log location for tensorboard (if None, no logging)
-    --:param create_eval_env: Whether to create a second environment that will be
-        used for evaluating the agent periodically (Only available when passing string for the environment).
-        Caution, this parameter is deprecated and will be removed in the future.
-        Please use `EvalCallback` or a custom Callback instead.
+    :param policy_actor_std: the constant std of the actor, for exploration during training
     :param policy_kwargs: additional arguments to be passed to the policy on creation
     :param verbose: Verbosity level: 0 for no output, 1 for info messages (such as device or wrappers used), 2 for
         debug messages
@@ -83,26 +75,27 @@ class ACER(OffPolicyAlgorithm):
     """
 
     policy_aliases: Dict[str, Type[BasePolicy]] = {
-        "MlpPolicy": ActorCriticAcerV2,
+        "MlpPolicy": ACERPolicy,
     }
 
-    policy: ActorCriticAcerV2
+    policy: ACERPolicy
     replay_buffer: PiTrajectoryReplayBuffer
 
     def __init__(
         self,
-        policy: Union[str, Type[ActorCriticAcerV2]],
+        policy: Union[str, Type[ACERPolicy]],
         env: Union[GymEnv, str],
-        lr_actor: Union[float, Schedule] = 1e-3,
-        lr_critic: Union[float, Schedule] = 1e-3,  # only usable in the ACERPolicy
-        buffer_num_trajectories: int = 2,
-        buffer_trajectory_size: int = 1000,  # epizode len
+        lr_actor: Union[float, Schedule] = 5e-4,
+        lr_critic: Union[float, Schedule] = 5e-4,  # only usable in the ACERPolicy
+        buffer_num_epizodes: int = 2,
+        buffer_epizode_size: int = 1000,
         learning_starts: int = 1000,
         batch_size: int = 32,
         buffer_sample_trajectory_size: int = 1,
         alpha: float = 0.3,  # SUM component
         tau: float = 3.00,  # min{policy_frac, b}; b = tau
         gamma: float = 0.99,
+        action_out_of_counds_loss_multiplier: float = 10000.0,
         train_freq: Union[int, Tuple[int, str]] = 4,
         gradient_steps: int = 1,
         replay_buffer_class: Optional[
@@ -112,7 +105,6 @@ class ACER(OffPolicyAlgorithm):
         optimize_memory_usage: bool = False,
         max_grad_norm: float = 3.0,
         tensorboard_log: Optional[str] = None,
-        create_eval_env: bool = False,
         policy_actor_std: float = 0.4,
         policy_kwargs: Optional[Dict[str, Any]] = None,
         verbose: int = 0,
@@ -129,8 +121,8 @@ class ACER(OffPolicyAlgorithm):
         super().__init__(
             policy,
             env,
-            # (lr_actor, lr_critic),
-            lr_actor,
+            (lr_actor, lr_critic),
+            # lr_actor,
             1,
             learning_starts,
             batch_size,
@@ -145,7 +137,6 @@ class ACER(OffPolicyAlgorithm):
             tensorboard_log=tensorboard_log,
             verbose=verbose,
             device=device,
-            create_eval_env=create_eval_env,
             seed=seed,
             sde_support=False,
             optimize_memory_usage=optimize_memory_usage,
@@ -154,8 +145,8 @@ class ACER(OffPolicyAlgorithm):
         )
 
         self.replay_buffer = replay_buffer_class(
-            buffer_num_trajectories=buffer_num_trajectories,
-            trajectory_size=buffer_trajectory_size,
+            buffer_num_trajectories=buffer_num_epizodes,
+            trajectory_size=buffer_epizode_size,
             observation_space=self.observation_space,
             action_space=self.action_space,
             device=self.device,
@@ -167,6 +158,7 @@ class ACER(OffPolicyAlgorithm):
         self.lr_actor = lr_actor
         self.lr_critic = lr_critic
         self.alpha = alpha
+        self.action_out_of_counds_loss_multiplier = action_out_of_counds_loss_multiplier
         # For updating the target network with multiple envs:
         self._n_calls = 0
         self.max_grad_norm = max_grad_norm
@@ -245,17 +237,9 @@ class ACER(OffPolicyAlgorithm):
                 dones = replay_data.dones[:, k]
                 rewards = replay_data.rewards[:, k]
 
-                # Log probabilities of the sampled actions according to the current policy
-                # current_values, current_log_probs, _ = self.policy.evaluate_actions(
-                #     observations, actions
-                # )
-
                 current_dist = self.policy.get_distribution(observations)
                 current_log_probs = current_dist.distribution.log_prob(actions)
                 current_values = self.policy.predict_values(observations)
-
-                # log_probs = log_probs.unsqueeze(-1)
-                # current_log_probs = current_log_probs.unsqueeze(-1)
 
                 if k == 0:
                     k0_current_log_probs = current_log_probs
@@ -300,18 +284,14 @@ class ACER(OffPolicyAlgorithm):
             )
             dist_mean = k0_current_dist.mode()
             action_mean_loss = (
-                th.maximum(th.abs(dist_mean) - 1.0, th.zeros_like(dist_mean)) * 10000.0
+                th.maximum(th.abs(dist_mean) - 1.0, th.zeros_like(dist_mean))
+                * self.action_out_of_counds_loss_multiplier
             )
 
             actor_loss = -k0_current_log_probs * SUM + action_mean_loss
             actor_loss = actor_loss.mean()
             critic_loss = -k0_current_values * SUM
             critic_loss = critic_loss.mean()
-
-            # self.policy.optimizer.zero_grad()
-            # loss.backward()
-            # th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-            # self.policy.optimizer.step()
 
             self.policy.critic.optimizer.zero_grad()
             critic_loss.backward()
@@ -326,8 +306,6 @@ class ACER(OffPolicyAlgorithm):
                 self.policy.actor.parameters(), self.max_grad_norm
             )
             self.policy.actor.optimizer.step()
-
-            # self.check_modules_not_nan(self.policy)
 
             loss = actor_loss + critic_loss
             losses.append(loss.item())
@@ -348,14 +326,6 @@ class ACER(OffPolicyAlgorithm):
         self.logger.record("train/action_mean_loss", np.mean(action_mean_losses))
         self.logger.record("train/action_std", np.mean(action_stds))
 
-    def check_modules_not_nan(self, m: nn.Module):
-        if hasattr(m, "data"):
-            if th.isnan(m.data).any():
-                a = 1  # place breakpoint here
-        else:
-            for m in m.parameters():
-                self.check_modules_not_nan(m)
-
     def _update_learning_rate(self) -> None:
         """
         Update the optimizers learning rate using the current learning rate schedule
@@ -368,7 +338,7 @@ class ACER(OffPolicyAlgorithm):
             "train/lr_critic", self.critic_lr_schedule(self._current_progress_remaining)
         )
 
-        if self.policy_class == ACERPolicy or self.policy_class == ActorCriticAcerV2:
+        if self.policy_class == ACERPolicy or self.policy_class == ACERPolicy:
             update_learning_rate(
                 self.policy.actor.optimizer,
                 self.actor_lr_schedule(self._current_progress_remaining),

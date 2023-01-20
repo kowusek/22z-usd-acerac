@@ -1,236 +1,53 @@
-import warnings
+"""Policies: abstract base class and concrete implementations."""
+
+import collections
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import gym
+import numpy as np
 import torch as th
 from torch import nn
 
 from stable_baselines3.common.distributions import (
+    BernoulliDistribution,
+    CategoricalDistribution,
+    DiagGaussianDistribution,
     Distribution,
-    SquashedDiagGaussianDistribution,
+    MultiCategoricalDistribution,
     StateDependentNoiseDistribution,
+    make_proba_distribution,
 )
-from stable_baselines3.common.policies import BasePolicy, ContinuousCritic
-from stable_baselines3.common.preprocessing import get_action_dim
-from stable_baselines3.common.torch_layers import (
-    BaseFeaturesExtractor,
-    FlattenExtractor,
-    create_mlp,
-    get_actor_critic_arch,
+from stable_baselines3.common.preprocessing import (
+    get_flattened_obs_dim,
 )
 from stable_baselines3.common.type_aliases import Schedule
-
-# CAP the standard deviation of the actor
-LOG_STD_MAX = 2
-LOG_STD_MIN = -20
-
-
-class Actor(BasePolicy):
-    """
-    Actor network (policy) from SAC: stable_baselines3.sac
-
-    :param observation_space: Obervation space
-    :param action_space: Action space
-    :param net_arch: Network architecture
-    :param features_extractor: Network to extract features
-        (a CNN when using images, a nn.Flatten() layer otherwise)
-    :param features_dim: Number of features
-    :param activation_fn: Activation function
-    :param use_sde: Whether to use State Dependent Exploration or not
-    :param log_std_init: Initial value for the log standard deviation
-    :param full_std: Whether to use (n_features x n_actions) parameters
-        for the std instead of only (n_features,) when using gSDE.
-    :param sde_net_arch: Network architecture for extracting features
-        when using gSDE. If None, the latent features from the policy will be used.
-        Pass an empty list to use the states as features.
-    :param use_expln: Use ``expln()`` function instead of ``exp()`` when using gSDE to ensure
-        a positive standard deviation (cf paper). It allows to keep variance
-        above zero and prevent it from growing too fast. In practice, ``exp()`` is usually enough.
-    :param clip_mean: Clip the mean output when using gSDE to avoid numerical instability.
-    :param normalize_images: Whether to normalize images or not,
-         dividing by 255.0 (True by default)
-    """
-
-    def __init__(
-        self,
-        observation_space: gym.spaces.Space,
-        action_space: gym.spaces.Space,
-        net_arch: List[int],
-        features_extractor: nn.Module,
-        features_dim: int,
-        activation_fn: Type[nn.Module] = nn.ReLU,
-        use_sde: bool = False,
-        log_std_init: float = -3,
-        full_std: bool = True,
-        sde_net_arch: Optional[List[int]] = None,
-        use_expln: bool = False,
-        clip_mean: float = 2.0,
-        normalize_images: bool = True,
-    ):
-        super().__init__(
-            observation_space,
-            action_space,
-            features_extractor=features_extractor,
-            normalize_images=normalize_images,
-            squash_output=True,
-        )
-
-        # Save arguments to re-create object at loading
-        self.use_sde = use_sde
-        self.sde_features_extractor = None
-        self.net_arch = net_arch
-        self.features_dim = features_dim
-        self.activation_fn = activation_fn
-        self.log_std_init = log_std_init
-        self.sde_net_arch = sde_net_arch
-        self.use_expln = use_expln
-        self.full_std = full_std
-        self.clip_mean = clip_mean
-
-        if sde_net_arch is not None:
-            warnings.warn(
-                "sde_net_arch is deprecated and will be removed in SB3 v2.4.0.",
-                DeprecationWarning,
-            )
-
-        action_dim = get_action_dim(self.action_space)
-        latent_pi_net = create_mlp(features_dim, -1, net_arch, activation_fn)
-        self.latent_pi = nn.Sequential(*latent_pi_net)
-        last_layer_dim = net_arch[-1] if len(net_arch) > 0 else features_dim
-
-        if self.use_sde:
-            self.action_dist = StateDependentNoiseDistribution(
-                action_dim,
-                full_std=full_std,
-                use_expln=use_expln,
-                learn_features=True,
-                squash_output=True,
-            )
-            self.mu, self.log_std = self.action_dist.proba_distribution_net(
-                latent_dim=last_layer_dim,
-                latent_sde_dim=last_layer_dim,
-                log_std_init=log_std_init,
-            )
-            # Avoid numerical issues by limiting the mean of the Gaussian
-            # to be in [-clip_mean, clip_mean]
-            if clip_mean > 0.0:
-                self.mu = nn.Sequential(
-                    self.mu, nn.Hardtanh(min_val=-clip_mean, max_val=clip_mean)
-                )
-        else:
-            self.action_dist = SquashedDiagGaussianDistribution(action_dim)
-            self.mu = nn.Linear(last_layer_dim, action_dim)
-            self.log_std = nn.Linear(last_layer_dim, action_dim)
-
-    def _get_constructor_parameters(self) -> Dict[str, Any]:
-        data = super()._get_constructor_parameters()
-
-        data.update(
-            dict(
-                net_arch=self.net_arch,
-                features_dim=self.features_dim,
-                activation_fn=self.activation_fn,
-                use_sde=self.use_sde,
-                log_std_init=self.log_std_init,
-                full_std=self.full_std,
-                use_expln=self.use_expln,
-                features_extractor=self.features_extractor,
-                clip_mean=self.clip_mean,
-            )
-        )
-        return data
-
-    def get_std(self) -> th.Tensor:
-        """
-        Retrieve the standard deviation of the action distribution.
-        Only useful when using gSDE.
-        It corresponds to ``th.exp(log_std)`` in the normal case,
-        but is slightly different when using ``expln`` function
-        (cf StateDependentNoiseDistribution doc).
-
-        :return:
-        """
-        msg = "get_std() is only available when using gSDE"
-        assert isinstance(self.action_dist, StateDependentNoiseDistribution), msg
-        return self.action_dist.get_std(self.log_std)
-
-    def reset_noise(self, batch_size: int = 1) -> None:
-        """
-        Sample new weights for the exploration matrix, when using gSDE.
-
-        :param batch_size:
-        """
-        msg = "reset_noise() is only available when using gSDE"
-        assert isinstance(self.action_dist, StateDependentNoiseDistribution), msg
-        self.action_dist.sample_weights(self.log_std, batch_size=batch_size)
-
-    def get_action_dist_params(
-        self, obs: th.Tensor
-    ) -> Tuple[th.Tensor, th.Tensor, Dict[str, th.Tensor]]:
-        """
-        Get the parameters for the action distribution.
-
-        :param obs:
-        :return:
-            Mean, standard deviation and optional keyword arguments.
-        """
-        features = self.extract_features(obs)
-        latent_pi = self.latent_pi(features)
-        mean_actions = self.mu(latent_pi)
-
-        if self.use_sde:
-            return mean_actions, self.log_std, dict(latent_sde=latent_pi)
-        # Unstructured exploration (Original implementation)
-        log_std = self.log_std(latent_pi)
-        # Original Implementation to cap the standard deviation
-        log_std = th.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
-        return mean_actions, log_std, {}
-
-    def forward(self, obs: th.Tensor, deterministic: bool = False) -> th.Tensor:
-        mean_actions, log_std, kwargs = self.get_action_dist_params(obs)
-        # Note: the action is squashed
-        return self.action_dist.actions_from_params(
-            mean_actions, log_std, deterministic=deterministic, **kwargs
-        )
-
-    def action_log_prob(self, obs: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
-        mean_actions, log_std, kwargs = self.get_action_dist_params(obs)
-        # return action and associated log prob
-        return self.action_dist.log_prob_from_params(mean_actions, log_std, **kwargs)
-
-    def log_prob_of_actions(self, obs: th.Tensor, actions: th.Tensor) -> th.Tensor:
-        mean_actions, log_std, kwargs = self.get_action_dist_params(obs)
-        dist = self.action_dist.proba_distribution(mean_actions, log_std, **kwargs)
-        return dist.log_prob(actions)
-
-    def get_distribution(self, obs: th.Tensor) -> Distribution:
-        mean_actions, log_std, kwargs = self.get_action_dist_params(obs)
-        return self.action_dist.proba_distribution(mean_actions, log_std, **kwargs)
-
-    def _predict(
-        self, observation: th.Tensor, deterministic: bool = False
-    ) -> th.Tensor:
-        return self(observation, deterministic)
+from stable_baselines3.common.policies import BasePolicy
 
 
 class ACERPolicy(BasePolicy):
     """
-    Policy class (with both actor and critic) for ACER.
+    Policy class for actor-critic algorithms (has both policy and value prediction).
+    Used by A2C, PPO and the likes.
 
     :param observation_space: Observation space
     :param action_space: Action space
     :param lr_schedule: Learning rate schedule (could be constant)
     :param net_arch: The specification of the policy and value networks.
     :param activation_fn: Activation function
+    :param ortho_init: Whether to use or not orthogonal initialization
     :param use_sde: Whether to use State Dependent Exploration or not
     :param log_std_init: Initial value for the log standard deviation
+    :param full_std: Whether to use (n_features x n_actions) parameters
+        for the std instead of only (n_features,) when using gSDE
     :param sde_net_arch: Network architecture for extracting features
         when using gSDE. If None, the latent features from the policy will be used.
         Pass an empty list to use the states as features.
-    :param use_expln: Use ``expln()`` function instead of ``exp()`` when using gSDE to ensure
+    :param use_expln: Use ``expln()`` function instead of ``exp()`` to ensure
         a positive standard deviation (cf paper). It allows to keep variance
         above zero and prevent it from growing too fast. In practice, ``exp()`` is usually enough.
-    :param clip_mean: Clip the mean output when using gSDE to avoid numerical instability.
+    :param squash_output: Whether to squash the output using a tanh function,
+        this allows to ensure boundaries when using gSDE.
     :param features_extractor_class: Features extractor to use.
     :param features_extractor_kwargs: Keyword arguments
         to pass to the features extractor.
@@ -240,128 +57,83 @@ class ACERPolicy(BasePolicy):
         ``th.optim.Adam`` by default
     :param optimizer_kwargs: Additional keyword arguments,
         excluding the learning rate, to pass to the optimizer
-    :param n_critics: Number of critic networks to create.
-    :param share_features_extractor: Whether to share or not the features extractor
-        between the actor and the critic (this saves computation time)
     """
+
+    actor: nn.Module
+    critic: nn.Module
 
     def __init__(
         self,
         observation_space: gym.spaces.Space,
         action_space: gym.spaces.Space,
-        lr_schedule: Union[Schedule, Tuple[Schedule, Schedule]],
-        net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
-        activation_fn: Type[nn.Module] = nn.ReLU,
+        lr_schedule: Schedule,
+        net_arch: Optional[List[Union[int, Dict[str, List[int]]]]] = None,
+        activation_fn: Type[nn.Module] = nn.Tanh,
+        ortho_init: bool = True,
         use_sde: bool = False,
-        log_std_init: float = -3,
-        sde_net_arch: Optional[List[int]] = None,
-        use_expln: bool = False,
-        clip_mean: float = 2.0,
-        features_extractor_class: Type[BaseFeaturesExtractor] = FlattenExtractor,
-        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
-        normalize_images: bool = True,
+        log_std_init: float = 0.0,
+        full_std: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
-        n_critics: int = 2,
-        share_features_extractor: bool = False,
     ):
+
+        if optimizer_kwargs is None:
+            optimizer_kwargs = {}
+            # Small values to avoid NaN in Adam optimizer
+            if optimizer_class == th.optim.Adam:
+                optimizer_kwargs["eps"] = 1e-5
+
         super().__init__(
             observation_space,
             action_space,
-            features_extractor_class,
-            features_extractor_kwargs,
             optimizer_class=optimizer_class,
             optimizer_kwargs=optimizer_kwargs,
-            squash_output=True,
         )
 
+        # Default network architecture, from stable-baselines
         if net_arch is None:
-            net_arch = [256, 256]
-
-        actor_arch, critic_arch = get_actor_critic_arch(net_arch)
+            net_arch = [dict(pi=[64, 64], vf=[64, 64])]
 
         self.net_arch = net_arch
         self.activation_fn = activation_fn
-        self.net_args = {
-            "observation_space": self.observation_space,
-            "action_space": self.action_space,
-            "net_arch": actor_arch,
-            "activation_fn": self.activation_fn,
-            "normalize_images": normalize_images,
-        }
-        self.actor_kwargs = self.net_args.copy()
+        self.ortho_init = ortho_init
 
-        if sde_net_arch is not None:
-            warnings.warn(
-                "sde_net_arch is deprecated and will be removed in SB3 v2.4.0.",
-                DeprecationWarning,
-            )
-
-        sde_kwargs = {
-            "use_sde": use_sde,
-            "log_std_init": log_std_init,
-            "use_expln": use_expln,
-            "clip_mean": clip_mean,
-        }
-        self.actor_kwargs.update(sde_kwargs)
-        self.critic_kwargs = self.net_args.copy()
-        self.critic_kwargs.update(
-            {
-                "n_critics": n_critics,
-                "net_arch": critic_arch,
-                "share_features_extractor": share_features_extractor,
+        self.log_std_init = log_std_init
+        dist_kwargs = None
+        # Keyword arguments for gSDE distribution
+        if use_sde:
+            dist_kwargs = {
+                "full_std": full_std,
+                "learn_features": False,
             }
-        )
 
-        self.actor: Actor = None
-        self.critic = None
-        self.share_features_extractor = share_features_extractor
+        self.use_sde = use_sde
+        self.dist_kwargs = dist_kwargs
+
+        # Action distribution
+        self.action_dist = make_proba_distribution(
+            action_space, use_sde=use_sde, dist_kwargs=dist_kwargs
+        )
+        self.log_std = th.ones(self.action_dist.action_dim) * log_std_init
 
         self._build(lr_schedule)
-
-    def _build(self, lr_schedule: Schedule) -> None:
-        if isinstance(lr_schedule, tuple):
-            actor_schedule, critic_schedule = lr_schedule
-        else:
-            actor_schedule, critic_schedule = lr_schedule, lr_schedule
-
-        self.actor = self.make_actor()
-        self.actor.optimizer = self.optimizer_class(
-            self.actor.parameters(), lr=actor_schedule(1), **self.optimizer_kwargs
-        )
-
-        if self.share_features_extractor:
-            self.critic, self.critic_extractor = self.make_critic(
-                features_extractor=self.actor.features_extractor
-            )
-            critic_parameters = self.critic.parameters()
-        else:
-            # Create a separate features extractor for the critic
-            # this requires more memory and computation
-            self.critic, self.critic_extractor = self.make_critic(
-                features_extractor=None
-            )
-            critic_parameters = list(self.critic.parameters()) + list(
-                self.critic_extractor.parameters()
-            )
-
-        self.critic.optimizer = self.optimizer_class(
-            critic_parameters, lr=critic_schedule(1), **self.optimizer_kwargs
-        )
 
     def _get_constructor_parameters(self) -> Dict[str, Any]:
         data = super()._get_constructor_parameters()
 
+        default_none_kwargs = self.dist_kwargs or collections.defaultdict(lambda: None)
+
         data.update(
             dict(
                 net_arch=self.net_arch,
-                activation_fn=self.net_args["activation_fn"],
-                use_sde=self.actor_kwargs["use_sde"],
-                log_std_init=self.actor_kwargs["log_std_init"],
-                use_expln=self.actor_kwargs["use_expln"],
-                clip_mean=self.actor_kwargs["clip_mean"],
-                n_critics=self.critic_kwargs["n_critics"],
+                activation_fn=self.activation_fn,
+                use_sde=self.use_sde,
+                log_std_init=self.log_std_init,
+                squash_output=default_none_kwargs["squash_output"],
+                full_std=default_none_kwargs["full_std"],
+                use_expln=default_none_kwargs["use_expln"],
                 lr_schedule=self._dummy_schedule,  # dummy lr schedule, not needed for loading policy alone
+                ortho_init=self.ortho_init,
                 optimizer_class=self.optimizer_class,
                 optimizer_kwargs=self.optimizer_kwargs,
                 features_extractor_class=self.features_extractor_class,
@@ -370,83 +142,154 @@ class ACERPolicy(BasePolicy):
         )
         return data
 
-    def reset_noise(self, batch_size: int = 1) -> None:
+    def reset_noise(self, n_envs: int = 1) -> None:
         """
-        Sample new weights for the exploration matrix, when using gSDE.
+        Sample new weights for the exploration matrix.
 
-        :param batch_size:
+        :param n_envs:
         """
-        self.actor.reset_noise(batch_size=batch_size)
+        assert isinstance(
+            self.action_dist, StateDependentNoiseDistribution
+        ), "reset_noise() is only available when using gSDE"
+        self.action_dist.sample_weights(self.log_std, batch_size=n_envs)
 
-    def make_actor(
-        self, features_extractor: Optional[BaseFeaturesExtractor] = None
-    ) -> Actor:
-        actor_kwargs = self._update_features_extractor(
-            self.actor_kwargs, features_extractor
-        )
-        return Actor(**actor_kwargs).to(self.device)
+    def _build(self, lr_schedule: Schedule) -> None:
+        """
+        Create the networks and the optimizer.
 
-    def make_critic(
-        self, features_extractor: Optional[BaseFeaturesExtractor] = None
-    ) -> Tuple[nn.Module, nn.Module]:
-        # creates a critic module and its extractor
-        critic_kwargs = self._update_features_extractor(
-            self.critic_kwargs, features_extractor
-        )
-        critic_modules = create_mlp(
-            critic_kwargs["features_dim"],
-            1,
-            critic_kwargs["net_arch"],
-            critic_kwargs["activation_fn"],
-        )
-        critic = nn.Sequential(*critic_modules).to(self.device)
-        return critic, critic_kwargs["features_extractor"]
+        :param lr_schedule: Learning rate schedule
+            lr_schedule(1) is the initial learning rate
+        """
 
-    def forward(self, obs: th.Tensor, deterministic: bool = False) -> th.Tensor:
-        return self._predict(obs, deterministic=deterministic)
+        if isinstance(lr_schedule, tuple):
+            actor_lr_schedule = lr_schedule[0]
+            critic_lr_schedule = lr_schedule[1]
+        else:
+            actor_lr_schedule = lr_schedule
+            critic_lr_schedule = lr_schedule
+
+        self.actor = nn.Sequential(
+            nn.Linear(get_flattened_obs_dim(self.observation_space), 64),
+            nn.Tanh(),
+            nn.Linear(64, self.action_dist.action_dim),
+        )
+        self.actor.optimizer = self.optimizer_class(
+            self.actor.parameters(), lr=actor_lr_schedule(1), **self.optimizer_kwargs
+        )
+
+        self.critic = nn.Sequential(
+            nn.Linear(get_flattened_obs_dim(self.observation_space), 64),
+            nn.Tanh(),
+            nn.Linear(64, 1),
+        )
+        self.critic.optimizer = self.optimizer_class(
+            self.critic.parameters(), lr=critic_lr_schedule(1), **self.optimizer_kwargs
+        )
+
+        # Init weights: use orthogonal initialization
+        # with small initial weight for the output
+        if self.ortho_init:
+            # Values from stable-baselines.
+            module_gains = {
+                self.actor: 0.01,
+                self.critic: 1,
+            }
+            for module, gain in module_gains.items():
+                module.apply(partial(self.init_weights, gain=gain))
+
+    def forward(
+        self, obs: th.Tensor, deterministic: bool = False
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Forward pass in all the networks (actor and critic)
+
+        :param obs: Observation
+        :param deterministic: Whether to sample or use deterministic actions
+        :return: action, value and log probability of the action
+        """
+        obs = obs.type(th.float32)
+        values = self.critic(obs)
+        mu = self.actor(obs)
+        distribution = self._get_action_dist_from_latent(mu)
+        actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.log_prob(actions)
+        actions = actions.reshape((-1,) + self.action_space.shape)
+        return actions, values, log_prob
+
+    def _get_action_dist_from_latent(self, mu: th.Tensor) -> Distribution:
+        """
+        Retrieve action distribution given the latent codes.
+
+        :param mu: mean of the distribution
+        :return: Action distribution
+        """
+        if isinstance(self.action_dist, DiagGaussianDistribution):
+            return self.action_dist.proba_distribution(mu, self.log_std)
+        elif isinstance(self.action_dist, CategoricalDistribution):
+            # Here mu are the logits before the softmax
+            return self.action_dist.proba_distribution(action_logits=mu)
+        elif isinstance(self.action_dist, MultiCategoricalDistribution):
+            # Here mu are the flattened logits
+            return self.action_dist.proba_distribution(action_logits=mu)
+        elif isinstance(self.action_dist, BernoulliDistribution):
+            # Here mu are the logits (before rounding to get the binary actions)
+            return self.action_dist.proba_distribution(action_logits=mu)
+        elif isinstance(self.action_dist, StateDependentNoiseDistribution):
+            raise NotImplementedError()
+        else:
+            raise ValueError("Invalid action distribution")
 
     def _predict(
         self, observation: th.Tensor, deterministic: bool = False
     ) -> th.Tensor:
-        return self.actor(observation, deterministic)
-
-    def set_training_mode(self, mode: bool) -> None:
         """
-        Put the policy in either training or evaluation mode.
+        Get the action according to the policy for a given observation.
 
-        This affects certain modules, such as batch normalisation and dropout.
-
-        :param mode: if true, set to training mode, else set to evaluation mode
+        :param observation:
+        :param deterministic: Whether to use stochastic or deterministic actions
+        :return: Taken action according to the policy
         """
-        self.actor.set_training_mode(mode)
-        self.critic.train(mode)
-        self.training = mode
+        observation = observation.type(th.float32)
+        return self.get_distribution(observation).get_actions(
+            deterministic=deterministic
+        )
 
-    def predict_values(self, obs: th.Tensor) -> th.Tensor:
-        """
-        Get the estimated values according to the current policy critic given the observations.
-
-        :param obs:
-        :return: the estimated values.
-        """
-        features = self.critic_extractor(obs.float())
-        return self.critic(features)
-
-    def evaluate_actions(self, obs: th.Tensor, actions: th.Tensor) -> th.Tensor:
+    def evaluate_actions(
+        self, obs: th.Tensor, actions: th.Tensor
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Evaluate actions according to the current policy,
         given the observations.
-        Returns the critic values of the observations and the actor log_probs of the actions.
 
         :param obs:
         :param actions:
         :return: estimated value, log likelihood of taking those actions
-            and entropy (None, only for compatibility with ActorCriticPolicy)
-            of the action distribution.
+            and entropy of the action distribution.
         """
-        log_probs = self.actor.log_prob_of_actions(obs, actions)
-        values = self.predict_values(obs)
-        return values, log_probs, None
+        obs = obs.type(th.float32)
+        mu = self.actor(obs)
+        distribution = self._get_action_dist_from_latent(mu)
+        log_prob = distribution.log_prob(actions)
+        values = self.critic(obs)
+        return values, log_prob, distribution.entropy()
 
     def get_distribution(self, obs: th.Tensor) -> Distribution:
-        return self.actor.get_distribution(obs)
+        """
+        Get the current policy distribution given the observations.
+
+        :param obs:
+        :return: the action distribution.
+        """
+        obs = obs.type(th.float32)
+        mu = self.actor(obs)
+        return self._get_action_dist_from_latent(mu)
+
+    def predict_values(self, obs: th.Tensor) -> th.Tensor:
+        """
+        Get the estimated values according to the current policy given the observations.
+
+        :param obs:
+        :return: the estimated values.
+        """
+        obs = obs.type(th.float32)
+        return self.critic(obs)
